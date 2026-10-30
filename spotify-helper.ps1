@@ -124,11 +124,17 @@ $script:lyricsFailedAt = @{}   # track key -> time of last network failure
 
 # returns parsed JSON, or $null on 404
 function Get-Json([string]$url) {
-    try {
-        $r = Invoke-WebRequest $url -UseBasicParsing -TimeoutSec 6 -Headers @{ 'User-Agent' = 'spotify-wallpaper (Wallpaper Engine)' }
-    } catch [System.Net.WebException] {
-        if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 404) { return $null }
-        throw
+    # lrclib regularly answers "server busy" (503) for a moment, so try a few times
+    for ($attempt = 1; ; $attempt++) {
+        try {
+            $r = Invoke-WebRequest $url -UseBasicParsing -TimeoutSec 8 -Headers @{ 'User-Agent' = 'spotify-wallpaper (Wallpaper Engine)' }
+            break
+        } catch [System.Net.WebException] {
+            $code = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
+            if ($code -eq 404) { return $null }
+            if ($attempt -ge 3 -or ($code -ne 0 -and $code -lt 500)) { throw }
+            Start-Sleep -Milliseconds (400 * $attempt)
+        }
     }
     # lrclib sends no charset, so decode as UTF-8 ourselves
     $json = [Text.Encoding]::UTF8.GetString($r.RawContentStream.ToArray()) | ConvertFrom-Json
@@ -149,17 +155,22 @@ function Get-Lyrics {
     $key = "$($props.Title)|$($props.Artist)"
     if ($script:lyricsCache.ContainsKey($key)) { return $script:lyricsCache[$key] }
 
-    # don't hammer lrclib when it's down: wait a minute after a failure
+    # don't hammer lrclib when it's down: wait a bit after a failure
+    # (shorter than the wallpaper's own retry delay, so its retry gets through)
     $failed = $script:lyricsFailedAt[$key]
-    if ($failed -and ((Get-Date) - $failed).TotalSeconds -lt 60) { return @{ key = $key; found = $false; retry = $true } }
+    if ($failed -and ((Get-Date) - $failed).TotalSeconds -lt 15) { return @{ key = $key; found = $false; retry = $true } }
 
     $tl = $s.GetTimelineProperties()
     $dur = [int]($tl.EndTime - $tl.StartTime).TotalSeconds
     $artist = ($props.Artist -split ',\s*')[0]
     $e = { param($v) [Uri]::EscapeDataString([string]$v) }
     try {
-        $r = Get-Json ("https://lrclib.net/api/get?track_name=$(& $e $props.Title)&artist_name=$(& $e $artist)" +
-            "&album_name=$(& $e $props.AlbumTitle)&duration=$dur")
+        # the exact lookup is only a shortcut; if it fails the search below still can find it
+        $r = $null
+        try {
+            $r = Get-Json ("https://lrclib.net/api/get?track_name=$(& $e $props.Title)&artist_name=$(& $e $artist)" +
+                "&album_name=$(& $e $props.AlbumTitle)&duration=$dur")
+        } catch { }
         if (-not $r -or -not ($r.syncedLyrics -or $r.instrumental)) {
             $list = @(Get-Json "https://lrclib.net/api/search?track_name=$(& $e (Get-CleanTitle $props.Title))&artist_name=$(& $e $artist)")
             # prefer synced lyrics of a version with about the same length
