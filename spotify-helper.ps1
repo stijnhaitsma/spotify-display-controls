@@ -148,14 +148,98 @@ function Get-CleanTitle([string]$t) {
     $t.Trim()
 }
 
+# lyrics found once are kept on disk, so they keep working when the lyrics sites are down
+$script:lyricsDir = Join-Path $env:LOCALAPPDATA 'SpotifyDisplay\lyrics'
+$script:lyricsCacheUntil = @{}  # track key -> time a temporary (memory) result expires
+
+function Get-LyricsFile([string]$key) {
+    $sha = [Security.Cryptography.SHA1]::Create()
+    $hash = -join ($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($key)) | ForEach-Object { $_.ToString('x2') })
+    Join-Path $script:lyricsDir "$hash.json"
+}
+
+# lrclib.net: synced (sometimes word-by-word) lyrics; $null when it doesn't have the track
+function Find-LrcLib($props, [string]$artist, [int]$dur) {
+    $e = { param($v) [Uri]::EscapeDataString([string]$v) }
+    # the exact lookup is only a shortcut; if it fails the search below still can find it
+    $r = $null
+    try {
+        $r = Get-Json ("https://lrclib.net/api/get?track_name=$(& $e $props.Title)&artist_name=$(& $e $artist)" +
+            "&album_name=$(& $e $props.AlbumTitle)&duration=$dur")
+    } catch { }
+    if (-not $r -or -not ($r.syncedLyrics -or $r.instrumental)) {
+        $list = @(Get-Json "https://lrclib.net/api/search?track_name=$(& $e (Get-CleanTitle $props.Title))&artist_name=$(& $e $artist)")
+        # prefer synced lyrics of a version with about the same length
+        $best = $list | Where-Object { $_.syncedLyrics -or $_.plainLyrics } |
+            Sort-Object { [bool]$_.syncedLyrics }, { -[math]::Abs($_.duration - $dur) } -Descending |
+            Select-Object -First 1
+        if ($best -and ($best.syncedLyrics -or -not $r)) { $r = $best }
+    }
+    if (-not $r) { return $null }
+    @{ synced = $r.syncedLyrics; plain = $r.plainLyrics; instrumental = [bool]$r.instrumental }
+}
+
+# NetEase Cloud Music: big catalogue with synced lyrics, used when lrclib has none or is down
+function Find-NetEase($props, [string]$artist, [int]$dur) {
+    $h = @{ 'User-Agent' = 'Mozilla/5.0' }
+    $title = Get-CleanTitle $props.Title
+    $r = Invoke-WebRequest 'https://music.163.com/api/search/get' -Method Post -UseBasicParsing -TimeoutSec 8 -Headers $h `
+        -Body @{ s = "$title $artist"; type = 1; limit = 10 }
+    $songs = ([Text.Encoding]::UTF8.GetString($r.RawContentStream.ToArray()) | ConvertFrom-Json).result.songs
+    # only accept the same title by the same artist with about the same length
+    $norm = { param($v) ([string]$v).ToLower() -replace '[^\p{L}\p{N}]', '' }
+    $want = & $norm $title
+    $wantArtist = & $norm $artist
+    $song = $songs | Where-Object {
+        (& $norm (Get-CleanTitle $_.name)) -eq $want -and
+        @($_.artists | Where-Object { (& $norm $_.name) -eq $wantArtist }).Count -gt 0 -and
+        [math]::Abs($_.duration / 1000 - $dur) -le 6
+    } | Sort-Object { [math]::Abs($_.duration / 1000 - $dur) } | Select-Object -First 1
+    if (-not $song) { return $null }
+
+    $l = Invoke-WebRequest "https://music.163.com/api/song/lyric?id=$($song.id)&lv=1&kv=1&tv=-1" -UseBasicParsing -TimeoutSec 8 -Headers $h
+    $lrc = [string]([Text.Encoding]::UTF8.GetString($l.RawContentStream.ToArray()) | ConvertFrom-Json).lrc.lyric
+    if (-not $lrc) { return $null }
+    # (regex escapes keep this file plain ASCII, which Windows PowerShell 5.1 reads reliably)
+    if ($lrc -match '\u7EAF\u97F3\u4E50') { return @{ instrumental = $true } }   # "instrumental, enjoy"
+    # drop the credit lines NetEase puts at the start, like "[00:00.000] (composer) : ..."
+    # and English ones like "Writers: ..." (also with a full-width colon) or sample credits "Title(1969)-Artist"
+    $credit = '^(\[[^\]]*\])+\s*([^\[]*[\u3400-\u9fff][^\[]*[:\uFF1A]|[^\[]{0,40}\uFF1A|(Producers?|Produced|Writers?|Written|Samples?|Composers?|Composed|Lyricists?|Lyrics|Arrange[dr]s?|Mix(ed|ing)?|Master(ed|ing)?|Record(ed|ing)?|Engineers?)( by)?\s*:|[^\[]*\(\d{4}\)\s*\u2014)'
+    $lines = $lrc -split "`n" | Where-Object { $_ -notmatch $credit }
+    $synced = ($lines -join "`n").Trim()
+    if ($synced -notmatch '\[\d+:\d+') { return $null }
+    @{ synced = $synced }
+}
+
+# lyrics.ovh: plain lyrics without timing, the last resort
+function Find-LyricsOvh($props, [string]$artist) {
+    $j = Get-Json "https://api.lyrics.ovh/v1/$([Uri]::EscapeDataString($artist))/$([Uri]::EscapeDataString((Get-CleanTitle $props.Title)))"
+    if (-not $j -or -not $j.lyrics) { return $null }
+    $text = ($j.lyrics -replace "`r", '') -replace '^Paroles de la chanson[^\n]*\n', ''
+    @{ plain = $text.Trim() }
+}
+
 function Get-Lyrics {
     $s = Get-Session
     if (-not $s) { return @{ found = $false } }
     $props = Await ($s.TryGetMediaPropertiesAsync()) $PropsType
     $key = "$($props.Title)|$($props.Artist)"
+
+    $until = $script:lyricsCacheUntil[$key]
+    if ($until -and (Get-Date) -gt $until) { $script:lyricsCache.Remove($key); $script:lyricsCacheUntil.Remove($key) }
     if ($script:lyricsCache.ContainsKey($key)) { return $script:lyricsCache[$key] }
 
-    # don't hammer lrclib when it's down: wait a bit after a failure
+    $file = Get-LyricsFile $key
+    if (Test-Path $file) {
+        try {
+            $d = Get-Content $file -Raw -Encoding UTF8 | ConvertFrom-Json
+            $res = @{ key = $key; found = $true; synced = $d.synced; plain = $d.plain; instrumental = [bool]$d.instrumental; source = $d.source }
+            $script:lyricsCache[$key] = $res
+            return $res
+        } catch { }
+    }
+
+    # don't hammer the sites when they're down: wait a bit after a failure
     # (shorter than the wallpaper's own retry delay, so its retry gets through)
     $failed = $script:lyricsFailedAt[$key]
     if ($failed -and ((Get-Date) - $failed).TotalSeconds -lt 15) { return @{ key = $key; found = $false; retry = $true } }
@@ -163,36 +247,53 @@ function Get-Lyrics {
     $tl = $s.GetTimelineProperties()
     $dur = [int]($tl.EndTime - $tl.StartTime).TotalSeconds
     $artist = ($props.Artist -split ',\s*')[0]
-    $e = { param($v) [Uri]::EscapeDataString([string]$v) }
-    try {
-        # the exact lookup is only a shortcut; if it fails the search below still can find it
-        $r = $null
+
+    # try the sources in order; synced lyrics win, plain lyrics are kept while looking further
+    $found = $null
+    $errors = @()
+    foreach ($src in 'lrclib', 'netease', 'lyrics.ovh') {
         try {
-            $r = Get-Json ("https://lrclib.net/api/get?track_name=$(& $e $props.Title)&artist_name=$(& $e $artist)" +
-                "&album_name=$(& $e $props.AlbumTitle)&duration=$dur")
-        } catch { }
-        if (-not $r -or -not ($r.syncedLyrics -or $r.instrumental)) {
-            $list = @(Get-Json "https://lrclib.net/api/search?track_name=$(& $e (Get-CleanTitle $props.Title))&artist_name=$(& $e $artist)")
-            # prefer synced lyrics of a version with about the same length
-            $best = $list | Where-Object { $_.syncedLyrics -or $_.plainLyrics } |
-                Sort-Object { [bool]$_.syncedLyrics }, { -[math]::Abs($_.duration - $dur) } -Descending |
-                Select-Object -First 1
-            if ($best -and ($best.syncedLyrics -or -not $r)) { $r = $best }
+            $r = switch ($src) {
+                'lrclib'     { Find-LrcLib $props $artist $dur }
+                'netease'    { Find-NetEase $props $artist $dur }
+                'lyrics.ovh' { Find-LyricsOvh $props $artist }
+            }
+        } catch {
+            $errors += "${src}: $($_.Exception.Message)"
+            continue
         }
-        if ($script:lyricsCache.Count -gt 200) { $script:lyricsCache.Clear() }
-        $res = @{
-            key          = $key
-            found        = [bool]$r
-            synced       = $(if ($r) { $r.syncedLyrics })
-            plain        = $(if ($r) { $r.plainLyrics })
-            instrumental = $(if ($r) { [bool]$r.instrumental } else { $false })
-        }
-        $script:lyricsCache[$key] = $res
-        $res
-    } catch {
-        $script:lyricsFailedAt[$key] = Get-Date
-        @{ key = $key; found = $false; retry = $true; error = $_.Exception.Message }
+        if (-not $r) { continue }
+        $r.source = $src
+        if ($r.synced -or $r.instrumental) { $found = $r; break }
+        if (-not $found) { $found = $r }
     }
+
+    if (-not $found -and $errors) {
+        $script:lyricsFailedAt[$key] = Get-Date
+        return @{ key = $key; found = $false; retry = $true; error = $errors -join '; ' }
+    }
+
+    $res = @{
+        key          = $key
+        found        = [bool]$found
+        synced       = $(if ($found) { $found.synced })
+        plain        = $(if ($found) { $found.plain })
+        instrumental = $(if ($found) { [bool]$found.instrumental } else { $false })
+        source       = $(if ($found) { $found.source })
+    }
+    if ($script:lyricsCache.Count -gt 200) { $script:lyricsCache.Clear(); $script:lyricsCacheUntil.Clear() }
+    $script:lyricsCache[$key] = $res
+    if ($found -and ($found.synced -or $found.instrumental -or -not $errors)) {
+        # a complete answer: keep it on disk for good
+        try {
+            New-Item -ItemType Directory -Force $script:lyricsDir | Out-Null
+            $res | ConvertTo-Json -Compress | Set-Content $file -Encoding UTF8
+        } catch { }
+    } else {
+        # nothing, or only plain lyrics while a site was down: look again in 5 minutes
+        $script:lyricsCacheUntil[$key] = (Get-Date).AddMinutes(5)
+    }
+    $res
 }
 
 function Invoke-MediaCommand([string]$action, $query) {

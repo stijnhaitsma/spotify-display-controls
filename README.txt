@@ -16,8 +16,11 @@ What it does
   A small PowerShell script (spotify-helper.ps1) runs hidden in the background.
   It reads what Spotify is playing through the Windows media controls, can
   control playback and Spotify's volume (Windows volume mixer), and fetches
-  lyrics from lrclib.net. It only listens on your own PC (http://localhost:5757)
-  and is plain text, so you can read exactly what it does.
+  lyrics from lrclib.net, with NetEase Cloud Music and lyrics.ovh as backups
+  when lrclib is down or doesn't have the song. Lyrics it found are kept in
+  %LOCALAPPDATA%\SpotifyDisplay\lyrics so they also work when those sites are
+  down. It only listens on your own PC (http://localhost:5757) and is plain
+  text, so you can read exactly what it does.
 
 Files
   spotify-helper.ps1  the helper itself
